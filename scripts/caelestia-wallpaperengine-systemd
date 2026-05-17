@@ -17,7 +17,7 @@ json_get() {
     local default="$2"
 
     if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
-        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+        jq -r --arg default "$default" "($expr) as \$value | if \$value == null then \$default else \$value end" "$config_file" 2>/dev/null || printf '%s\n' "$default"
     else
         printf '%s\n' "$default"
     fi
@@ -144,7 +144,7 @@ case "$action" in
         "$script_dir/caelestia-wallpaperengine-random" --force
         ;;
     restore)
-        CAELESTIA_WALLPAPERENGINE_NO_DELAY=1 "$script_dir/caelestia-wallpaperengine-restore"
+        CAELESTIA_WALLPAPERENGINE_NO_DELAY=1 CAELESTIA_WALLPAPERENGINE_IGNORE_AUTOSTART=1 "$script_dir/caelestia-wallpaperengine-restore"
         ;;
     *)
         printf 'Usage: %s [apply|next|restore]\n' "$0" >&2

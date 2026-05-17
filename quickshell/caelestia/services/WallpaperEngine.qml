@@ -50,6 +50,7 @@ Singleton {
         config.randomSwitch = config.randomSwitch ?? {};
         config.randomSwitch.enabled = root.randomSwitchEnabled;
         config.randomSwitch.intervalMinutes = Math.max(1, Math.round(root.randomSwitchIntervalMinutes));
+        config.randomSwitch.pauseWhenLocked = config.randomSwitch.pauseWhenLocked ?? true;
 
         configFile.setText(JSON.stringify(config, null, 2) + "\n");
         applySystemd();

@@ -30,7 +30,8 @@ if [[ ! -f "$engine_config" ]]; then
   "autostart": true,
   "randomSwitch": {
     "enabled": false,
-    "intervalMinutes": 30
+    "intervalMinutes": 30,
+    "pauseWhenLocked": true
   },
   "startupGrace": 3,
   "quarantineFailed": true,
@@ -43,13 +44,14 @@ fi
 tmp="$(mktemp)"
 jq '
   .startupGrace = (.startupGrace // 3)
-  | .quarantineFailed = (.quarantineFailed // true)
+  | .quarantineFailed = (if .quarantineFailed == null then true else .quarantineFailed end)
   | .command = (.command // "~/.local/bin/linux-wallpaperengine")
   | .failedPreviewDir = (.failedPreviewDir // "~/.local/state/caelestia/wallpaperengine/failed-previews")
-  | .autostart = (.autostart // true)
+  | .autostart = (if .autostart == null then true else .autostart end)
   | .randomSwitch = (.randomSwitch // {})
-  | .randomSwitch.enabled = (.randomSwitch.enabled // false)
+  | .randomSwitch.enabled = (if .randomSwitch.enabled == null then false else .randomSwitch.enabled end)
   | .randomSwitch.intervalMinutes = (.randomSwitch.intervalMinutes // 30)
+  | .randomSwitch.pauseWhenLocked = (if .randomSwitch.pauseWhenLocked == null then true else .randomSwitch.pauseWhenLocked end)
   | .includeTypes = (
       if (.includeTypes? | type) == "array" then
         .includeTypes

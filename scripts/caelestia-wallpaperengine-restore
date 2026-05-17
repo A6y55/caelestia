@@ -14,7 +14,7 @@ json_get() {
     local default="$2"
 
     if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
-        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+        jq -r --arg default "$default" "($expr) as \$value | if \$value == null then \$default else \$value end" "$config_file" 2>/dev/null || printf '%s\n' "$default"
     else
         printf '%s\n' "$default"
     fi
@@ -40,7 +40,11 @@ ensure_wayland_env() {
     fi
 }
 
-if ! json_bool '.enabled' 'true' || ! json_bool '.autostart' 'true'; then
+if ! json_bool '.enabled' 'true'; then
+    exit 0
+fi
+
+if [[ "${CAELESTIA_WALLPAPERENGINE_IGNORE_AUTOSTART:-0}" != "1" ]] && ! json_bool '.autostart' 'true'; then
     exit 0
 fi
 
