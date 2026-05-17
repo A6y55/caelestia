@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+action="${1:-apply}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia/wallpaperengine.json"
+systemd_user_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+restore_unit="$systemd_user_dir/caelestia-wallpaperengine-restore.service"
+random_service="$systemd_user_dir/caelestia-wallpaperengine-random.service"
+random_timer="$systemd_user_dir/caelestia-wallpaperengine-random.timer"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/wallpaperengine"
+pid_file="$state_dir/pid"
+
+json_get() {
+    local expr="$1"
+    local default="$2"
+
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+    else
+        printf '%s\n' "$default"
+    fi
+}
+
+json_bool() {
+    local expr="$1"
+    local default="$2"
+    local value
+
+    value="$(json_get "$expr" "$default")"
+    [[ "$value" == "true" || "$value" == "1" || "$value" == "yes" ]]
+}
+
+write_units() {
+    local interval_minutes="$1"
+
+    mkdir -p "$systemd_user_dir"
+
+    cat >"$restore_unit" <<EOF
+[Unit]
+Description=Restore Caelestia Wallpaper Engine wallpaper
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=$script_dir/caelestia-wallpaperengine-restore
+
+[Install]
+WantedBy=default.target
+EOF
+
+    cat >"$random_service" <<EOF
+[Unit]
+Description=Switch to a random Caelestia Wallpaper Engine wallpaper
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=$script_dir/caelestia-wallpaperengine-random
+EOF
+
+    cat >"$random_timer" <<EOF
+[Unit]
+Description=Timed Caelestia Wallpaper Engine wallpaper switching
+
+[Timer]
+OnBootSec=${interval_minutes}min
+OnUnitActiveSec=${interval_minutes}min
+AccuracySec=30s
+Persistent=true
+Unit=caelestia-wallpaperengine-random.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+systemctl_user() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user "$@" || return 1
+    fi
+}
+
+stop_wallpaperengine() {
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid="$(<"$pid_file")"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        while read -r pid; do
+            [[ -n "$pid" && "$pid" != "$$" ]] && kill "$pid" 2>/dev/null || true
+        done < <(pgrep -u "$(id -u)" -f '(^|/)linux-wallpaperengine( |$)' || true)
+    fi
+}
+
+apply_units() {
+    local interval_minutes
+    interval_minutes="$(json_get '.randomSwitch.intervalMinutes' '30')"
+    if ! [[ "$interval_minutes" =~ ^[0-9]+$ ]] || [[ "$interval_minutes" -lt 1 ]]; then
+        interval_minutes=30
+    fi
+
+    write_units "$interval_minutes"
+    systemctl_user daemon-reload || true
+
+    if json_bool '.enabled' 'true' && json_bool '.autostart' 'true'; then
+        systemctl_user enable caelestia-wallpaperengine-restore.service || true
+        systemctl_user start caelestia-wallpaperengine-restore.service || true
+    else
+        systemctl_user disable --now caelestia-wallpaperengine-restore.service || true
+    fi
+
+    if json_bool '.enabled' 'true' && json_bool '.randomSwitch.enabled' 'false'; then
+        systemctl_user enable caelestia-wallpaperengine-random.timer || true
+        systemctl_user restart caelestia-wallpaperengine-random.timer || true
+    else
+        systemctl_user disable --now caelestia-wallpaperengine-random.timer || true
+    fi
+
+    if ! json_bool '.enabled' 'true'; then
+        stop_wallpaperengine
+    fi
+}
+
+case "$action" in
+    apply)
+        apply_units
+        ;;
+    next)
+        "$script_dir/caelestia-wallpaperengine-random" --force
+        ;;
+    restore)
+        CAELESTIA_WALLPAPERENGINE_NO_DELAY=1 "$script_dir/caelestia-wallpaperengine-restore"
+        ;;
+    *)
+        printf 'Usage: %s [apply|next|restore]\n' "$0" >&2
+        exit 2
+        ;;
+esac

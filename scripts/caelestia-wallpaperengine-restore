@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia/wallpaperengine.json"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia"
+wallpaper_path_file="$state_dir/wallpaper/path.txt"
+engine_state_dir="$state_dir/wallpaperengine"
+last_good_path_file="$engine_state_dir/last-good-path"
+hook="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/caelestia-wallpaperengine-hook"
+
+json_get() {
+    local expr="$1"
+    local default="$2"
+
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+    else
+        printf '%s\n' "$default"
+    fi
+}
+
+json_bool() {
+    local expr="$1"
+    local default="$2"
+    local value
+
+    value="$(json_get "$expr" "$default")"
+    [[ "$value" == "true" || "$value" == "1" || "$value" == "yes" ]]
+}
+
+ensure_wayland_env() {
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
+        local socket
+        socket="$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n 1 || true)"
+        export WAYLAND_DISPLAY="${socket:-wayland-1}"
+    fi
+}
+
+if ! json_bool '.enabled' 'true' || ! json_bool '.autostart' 'true'; then
+    exit 0
+fi
+
+delay="$(json_get '.restoreDelay' '5')"
+if [[ "${CAELESTIA_WALLPAPERENGINE_NO_DELAY:-0}" != "1" && "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    sleep "$delay"
+fi
+
+selected=""
+if [[ -f "$wallpaper_path_file" ]]; then
+    selected="$(<"$wallpaper_path_file")"
+fi
+
+if [[ -z "$selected" || ! -e "$selected" ]] && [[ -f "$last_good_path_file" ]]; then
+    selected="$(<"$last_good_path_file")"
+fi
+
+if [[ -z "$selected" || ! -e "$selected" ]]; then
+    exit 0
+fi
+
+ensure_wayland_env
+WALLPAPER_PATH="$selected" "$hook" "$selected"

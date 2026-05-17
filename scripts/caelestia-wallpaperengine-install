@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia"
+engine_config="$config_dir/wallpaperengine.json"
+cli_config="$config_dir/cli.json"
+shell_config="$config_dir/shell.json"
+hook="$script_dir/caelestia-wallpaperengine-hook"
+sync_script="$script_dir/caelestia-wallpaperengine-sync"
+
+mkdir -p "$config_dir"
+
+if [[ ! -f "$engine_config" ]]; then
+    cat >"$engine_config" <<EOF
+{
+  "enabled": true,
+  "screen": "auto",
+  "workshopDir": "~/.local/share/Steam/steamapps/workshop/content/431960",
+  "assetsDir": "~/.local/share/Steam/steamapps/common/wallpaper_engine/assets",
+  "command": "~/.local/bin/linux-wallpaperengine",
+  "previewDir": "~/Pictures/Wallpapers/WallpaperEngine",
+  "failedPreviewDir": "~/.local/state/caelestia/wallpaperengine/failed-previews",
+  "fps": 30,
+  "silent": true,
+  "scaling": "fill",
+  "clamp": "border",
+  "includeTypes": ["video", "scene", "web"],
+  "autostart": true,
+  "randomSwitch": {
+    "enabled": false,
+    "intervalMinutes": 30
+  },
+  "startupGrace": 3,
+  "quarantineFailed": true,
+  "stopOnStaticWallpaper": true,
+  "fullscreenPauseOnlyActive": true
+}
+EOF
+fi
+
+tmp="$(mktemp)"
+jq '
+  .startupGrace = (.startupGrace // 3)
+  | .quarantineFailed = (.quarantineFailed // true)
+  | .command = (.command // "~/.local/bin/linux-wallpaperengine")
+  | .failedPreviewDir = (.failedPreviewDir // "~/.local/state/caelestia/wallpaperengine/failed-previews")
+  | .autostart = (.autostart // true)
+  | .randomSwitch = (.randomSwitch // {})
+  | .randomSwitch.enabled = (.randomSwitch.enabled // false)
+  | .randomSwitch.intervalMinutes = (.randomSwitch.intervalMinutes // 30)
+  | .includeTypes = (
+      if (.includeTypes? | type) == "array" then
+        .includeTypes
+      else
+        ["video", "scene", "web"]
+      end
+    )
+' "$engine_config" >"$tmp"
+mv "$tmp" "$engine_config"
+
+tmp="$(mktemp)"
+if [[ -f "$cli_config" ]]; then
+    jq --arg hook "$hook" '.wallpaper = (.wallpaper // {}) | .wallpaper.postHook = $hook' "$cli_config" >"$tmp"
+else
+    jq -n --arg hook "$hook" '{wallpaper: {postHook: $hook}}' >"$tmp"
+fi
+mv "$tmp" "$cli_config"
+
+tmp="$(mktemp)"
+if [[ -f "$shell_config" ]]; then
+    jq '.paths = (.paths // {}) | .paths.wallpaperDir = (.paths.wallpaperDir // "~/Pictures/Wallpapers")' "$shell_config" >"$tmp"
+else
+    jq -n '{paths: {wallpaperDir: "~/Pictures/Wallpapers"}}' >"$tmp"
+fi
+mv "$tmp" "$shell_config"
+
+"$sync_script"
+"$script_dir/caelestia-wallpaperengine-systemd" apply || true
+
+printf 'Configured Caelestia Wallpaper Engine integration.\n'
+printf 'Restart Caelestia shell if the wallpaper list was already open: caelestia shell -k; caelestia shell -d\n'

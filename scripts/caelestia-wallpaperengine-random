@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+force=false
+if [[ "${1:-}" == "--force" ]]; then
+    force=true
+fi
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia/wallpaperengine.json"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/wallpaperengine"
+log_file="$state_dir/random-switch.log"
+
+expand_path() {
+    local path="$1"
+    path="${path/#\~/$HOME}"
+    path="${path//\$HOME/$HOME}"
+    printf '%s\n' "$path"
+}
+
+json_get() {
+    local expr="$1"
+    local default="$2"
+
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+    else
+        printf '%s\n' "$default"
+    fi
+}
+
+json_bool() {
+    local expr="$1"
+    local default="$2"
+    local value
+
+    value="$(json_get "$expr" "$default")"
+    [[ "$value" == "true" || "$value" == "1" || "$value" == "yes" ]]
+}
+
+ensure_wayland_env() {
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
+        local socket
+        socket="$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n 1 || true)"
+        export WAYLAND_DISPLAY="${socket:-wayland-1}"
+    fi
+}
+
+mkdir -p "$state_dir"
+ensure_wayland_env
+
+if ! json_bool '.enabled' 'true'; then
+    exit 0
+fi
+
+if [[ "$force" != "true" ]] && ! json_bool '.randomSwitch.enabled' 'false'; then
+    exit 0
+fi
+
+"$script_dir/caelestia-wallpaperengine-sync" >/dev/null
+
+preview_dir="$(expand_path "$(json_get '.previewDir' '~/Pictures/Wallpapers/WallpaperEngine')")"
+manifest="$preview_dir/.wallpaperengine-map.tsv"
+if [[ ! -f "$manifest" ]]; then
+    printf '[%s] missing manifest: %s\n' "$(date -Is)" "$manifest" >>"$log_file"
+    exit 0
+fi
+
+current="$(caelestia wallpaper 2>/dev/null || true)"
+candidates=()
+fallback=()
+
+while IFS=$'\t' read -r path id project_type source; do
+    [[ -f "$path" ]] || continue
+    fallback+=("$path")
+    [[ "$path" == "$current" ]] && continue
+    candidates+=("$path")
+done <"$manifest"
+
+if [[ "${#candidates[@]}" -eq 0 ]]; then
+    candidates=("${fallback[@]}")
+fi
+
+if [[ "${#candidates[@]}" -eq 0 ]]; then
+    printf '[%s] no Wallpaper Engine previews available\n' "$(date -Is)" >>"$log_file"
+    exit 0
+fi
+
+choice="${candidates[$((RANDOM % ${#candidates[@]}))]}"
+printf '[%s] switching to %s\n' "$(date -Is)" "$choice" >>"$log_file"
+caelestia wallpaper -f "$choice"

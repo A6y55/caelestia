@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+
+set -u
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/wallpaperengine"
+config_file="$config_dir/wallpaperengine.json"
+pid_file="$state_dir/pid"
+log_file="$state_dir/linux-wallpaperengine.log"
+last_good_path_file="$state_dir/last-good-path"
+last_good_id_file="$state_dir/last-good-id"
+failed_ids_file="$state_dir/failed-ids"
+
+expand_path() {
+    local path="$1"
+    path="${path/#\~/$HOME}"
+    path="${path//\$HOME/$HOME}"
+    printf '%s\n' "$path"
+}
+
+json_get() {
+    local expr="$1"
+    local default="$2"
+
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+    else
+        printf '%s\n' "$default"
+    fi
+}
+
+json_bool() {
+    local expr="$1"
+    local default="$2"
+    local value
+
+    value="$(json_get "$expr" "$default")"
+    [[ "$value" == "true" || "$value" == "1" || "$value" == "yes" ]]
+}
+
+ensure_wayland_env() {
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
+        local socket
+        socket="$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n 1 || true)"
+        export WAYLAND_DISPLAY="${socket:-wayland-1}"
+    fi
+}
+
+stop_existing() {
+    local keep_pid="${1:-}"
+
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid="$(<"$pid_file")"
+        if [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$keep_pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        while read -r pid; do
+            [[ -n "$pid" && "$pid" != "$$" && "$pid" != "$keep_pid" ]] && kill "$pid" 2>/dev/null || true
+        done < <(pgrep -u "$(id -u)" -f '(^|/)linux-wallpaperengine( |$)' || true)
+    fi
+
+    if [[ -z "$keep_pid" ]]; then
+        rm -f "$pid_file"
+    fi
+}
+
+detect_screens() {
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        local configured
+        configured="$(jq -r '.screens[]? // empty' "$config_file" 2>/dev/null)"
+        if [[ -n "$configured" ]]; then
+            printf '%s\n' "$configured"
+            return
+        fi
+    fi
+
+    local screen
+    screen="$(json_get '.screen' 'auto')"
+    if [[ "$screen" != "auto" && -n "$screen" ]]; then
+        printf '%s\n' "$screen"
+        return
+    fi
+
+    if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        hyprctl monitors -j 2>/dev/null | jq -r '.[].name'
+    fi
+}
+
+quarantine_failed() {
+    local id="$1"
+    local path="$2"
+
+    printf '[%s] failed wallpaper: %s (%s)\n' "$(date -Is)" "$id" "$path" >>"$log_file"
+    grep -Fxq "$id" "$failed_ids_file" 2>/dev/null || printf '%s\n' "$id" >>"$failed_ids_file"
+
+    if json_bool '.quarantineFailed' 'true'; then
+        local failed_dir
+        failed_dir="$(expand_path "$(json_get '.failedPreviewDir' "$state_dir/failed-previews")")"
+        mkdir -p "$failed_dir"
+        for candidate in "$preview_dir/$id".*; do
+            [[ -f "$candidate" ]] || continue
+            case "${candidate##*.}" in
+                jpg|jpeg|png|gif|webp|JPG|JPEG|PNG|GIF|WEBP)
+                    mv -f "$candidate" "$failed_dir/$(basename "$candidate")" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+}
+
+restore_last_good() {
+    if [[ -f "$last_good_path_file" ]]; then
+        local last_good
+        last_good="$(<"$last_good_path_file")"
+        if [[ -n "$last_good" && "$last_good" != "$selected_real" && -f "$last_good" ]] && command -v caelestia >/dev/null 2>&1; then
+            printf '[%s] restoring last good wallpaper: %s\n' "$(date -Is)" "$last_good" >>"$log_file"
+            CAELESTIA_WALLPAPERENGINE_RESTORE=1 caelestia wallpaper -f "$last_good" >/dev/null 2>>"$log_file" || true
+        fi
+    fi
+}
+
+mkdir -p "$state_dir"
+
+selected="${WALLPAPER_PATH:-${1:-}}"
+if [[ -z "$selected" ]]; then
+    exit 0
+fi
+
+if ! json_bool '.enabled' 'true'; then
+    exit 0
+fi
+
+preview_dir="$(expand_path "$(json_get '.previewDir' '~/Pictures/Wallpapers/WallpaperEngine')")"
+preview_real="$(readlink -f "$preview_dir" 2>/dev/null || printf '%s\n' "$preview_dir")"
+selected_real="$(readlink -f "$selected" 2>/dev/null || printf '%s\n' "$selected")"
+selected_base="$(basename "$selected_real")"
+
+wallpaper_id=""
+if [[ "$selected_real" == "$preview_real"/* && "$selected_base" =~ ^([0-9]+)\.(jpe?g|png|gif|webp)$ ]]; then
+    wallpaper_id="${BASH_REMATCH[1]}"
+fi
+
+if [[ -z "$wallpaper_id" ]]; then
+    if json_bool '.stopOnStaticWallpaper' 'true'; then
+        stop_existing
+    fi
+    exit 0
+fi
+
+workshop_dir="$(expand_path "$(json_get '.workshopDir' '~/.local/share/Steam/steamapps/workshop/content/431960')")"
+assets_dir="$(expand_path "$(json_get '.assetsDir' '~/.local/share/Steam/steamapps/common/wallpaper_engine/assets')")"
+engine_command="$(expand_path "$(json_get '.command' '~/.local/bin/linux-wallpaperengine')")"
+fps="$(json_get '.fps' '30')"
+scaling="$(json_get '.scaling' 'fill')"
+clamp="$(json_get '.clamp' 'border')"
+volume="$(json_get '.volume' '15')"
+startup_grace="$(json_get '.startupGrace' '3')"
+
+if grep -Fxq "$wallpaper_id" "$failed_ids_file" 2>/dev/null; then
+    printf '[%s] skipped known failed wallpaper: %s\n' "$(date -Is)" "$wallpaper_id" >>"$log_file"
+    restore_last_good
+    exit 0
+fi
+
+if [[ ! -d "$workshop_dir/$wallpaper_id" ]]; then
+    printf '[%s] missing workshop wallpaper: %s\n' "$(date -Is)" "$workshop_dir/$wallpaper_id" >>"$log_file"
+    exit 0
+fi
+
+if [[ ! -x "$engine_command" ]]; then
+    engine_command="$(command -v linux-wallpaperengine 2>/dev/null || true)"
+fi
+
+if [[ -z "$engine_command" ]]; then
+    printf '[%s] linux-wallpaperengine command not found for wallpaper %s\n' "$(date -Is)" "$wallpaper_id" >>"$log_file"
+    exit 0
+fi
+
+project_type="unknown"
+if [[ -f "$workshop_dir/$wallpaper_id/project.json" ]] && command -v jq >/dev/null 2>&1; then
+    project_type="$(jq -r '.type // "unknown" | tostring | ascii_downcase' "$workshop_dir/$wallpaper_id/project.json" 2>/dev/null || printf 'unknown\n')"
+fi
+
+ensure_wayland_env
+
+mapfile -t screens < <(detect_screens)
+if [[ "${#screens[@]}" -eq 0 ]]; then
+    printf '[%s] no screen found for wallpaper %s\n' "$(date -Is)" "$wallpaper_id" >>"$log_file"
+    exit 0
+fi
+
+cmd=("$engine_command")
+for screen in "${screens[@]}"; do
+    [[ -n "$screen" ]] || continue
+    cmd+=(--screen-root "$screen" --bg "$wallpaper_id")
+done
+
+cmd+=(--fps "$fps")
+[[ -n "$scaling" ]] && cmd+=(--scaling "$scaling")
+[[ -n "$clamp" ]] && cmd+=(--clamp "$clamp")
+[[ -d "$assets_dir" ]] && cmd+=(--assets-dir "$assets_dir")
+
+if json_bool '.silent' 'true'; then
+    cmd+=(--silent)
+else
+    cmd+=(--volume "$volume")
+fi
+
+json_bool '.disableMouse' 'false' && cmd+=(--disable-mouse)
+json_bool '.disableParallax' 'false' && cmd+=(--disable-parallax)
+json_bool '.disableParticles' 'false' && cmd+=(--disable-particles)
+json_bool '.noFullscreenPause' 'false' && cmd+=(--no-fullscreen-pause)
+json_bool '.fullscreenPauseOnlyActive' 'true' && cmd+=(--fullscreen-pause-only-active)
+
+printf '[%s] starting %s wallpaper %s:' "$(date -Is)" "$project_type" "$wallpaper_id" >>"$log_file"
+printf ' %q' "${cmd[@]}" >>"$log_file"
+printf '\n' >>"$log_file"
+
+new_pid=""
+if command -v setsid >/dev/null 2>&1; then
+    setsid "${cmd[@]}" >>"$log_file" 2>&1 &
+    new_pid="$!"
+else
+    "${cmd[@]}" >>"$log_file" 2>&1 &
+    new_pid="$!"
+fi
+
+sleep "$startup_grace"
+
+if [[ "$new_pid" =~ ^[0-9]+$ ]] && kill -0 "$new_pid" 2>/dev/null; then
+    stop_existing "$new_pid"
+    printf '%s\n' "$new_pid" >"$pid_file"
+    printf '%s\n' "$selected_real" >"$last_good_path_file"
+    printf '%s\n' "$wallpaper_id" >"$last_good_id_file"
+else
+    quarantine_failed "$wallpaper_id" "$selected_real"
+    restore_last_good
+fi

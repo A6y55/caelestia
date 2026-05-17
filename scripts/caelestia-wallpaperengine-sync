@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/caelestia/wallpaperengine.json"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/caelestia/wallpaperengine"
+failed_ids_file="$state_dir/failed-ids"
+
+expand_path() {
+    local path="$1"
+    path="${path/#\~/$HOME}"
+    path="${path//\$HOME/$HOME}"
+    printf '%s\n' "$path"
+}
+
+json_get() {
+    local expr="$1"
+    local default="$2"
+
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg default "$default" "$expr // \$default" "$config_file" 2>/dev/null
+    else
+        printf '%s\n' "$default"
+    fi
+}
+
+load_include_types() {
+    if [[ -f "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '
+          if (.includeTypes? | type) == "array" then
+            .includeTypes[] | tostring | ascii_downcase
+          else
+            empty
+          end
+        ' "$config_file" 2>/dev/null
+    fi
+}
+
+type_is_enabled() {
+    local project_type="$1"
+    local include_type
+
+    if [[ "${#include_types[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    for include_type in "${include_types[@]}"; do
+        [[ "$project_type" == "$include_type" ]] && return 0
+    done
+
+    return 1
+}
+
+workshop_dir="$(expand_path "$(json_get '.workshopDir' '~/.local/share/Steam/steamapps/workshop/content/431960')")"
+preview_dir="$(expand_path "$(json_get '.previewDir' '~/Pictures/Wallpapers/WallpaperEngine')")"
+failed_preview_dir="$(expand_path "$(json_get '.failedPreviewDir' "$state_dir/failed-previews")")"
+manifest="$preview_dir/.wallpaperengine-map.tsv"
+
+if [[ ! -d "$workshop_dir" ]]; then
+    printf 'Workshop directory not found: %s\n' "$workshop_dir" >&2
+    exit 1
+fi
+
+mkdir -p "$preview_dir" "$state_dir" "$failed_preview_dir"
+if [[ -d "$preview_dir/.failed" ]]; then
+    while IFS= read -r -d '' failed_preview; do
+        mv -f "$failed_preview" "$failed_preview_dir/$(basename "$failed_preview")" 2>/dev/null || true
+    done < <(find "$preview_dir/.failed" -maxdepth 1 -type f -print0)
+    rmdir "$preview_dir/.failed" 2>/dev/null || true
+fi
+
+mapfile -t include_types < <(load_include_types)
+if [[ "${#include_types[@]}" -eq 0 ]]; then
+    include_types=(video scene web)
+fi
+
+tmp_manifest="$(mktemp)"
+count=0
+skipped_failed=0
+skipped_type=0
+declare -A synced_files=()
+
+for dir in "$workshop_dir"/*; do
+    [[ -d "$dir" ]] || continue
+
+    id="$(basename "$dir")"
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    if grep -Fxq "$id" "$failed_ids_file" 2>/dev/null; then
+        skipped_failed=$((skipped_failed + 1))
+        continue
+    fi
+
+    project_type="unknown"
+    if [[ -f "$dir/project.json" ]] && command -v jq >/dev/null 2>&1; then
+        project_type="$(jq -r '.type // "unknown" | tostring | ascii_downcase' "$dir/project.json" 2>/dev/null || printf 'unknown\n')"
+    fi
+
+    if ! type_is_enabled "$project_type"; then
+        skipped_type=$((skipped_type + 1))
+        continue
+    fi
+
+    preview=""
+    if [[ -f "$dir/project.json" ]] && command -v jq >/dev/null 2>&1; then
+        rel="$(jq -r '.preview // empty' "$dir/project.json" 2>/dev/null || true)"
+        [[ -n "$rel" && -f "$dir/$rel" ]] && preview="$dir/$rel"
+    fi
+
+    if [[ -z "$preview" ]]; then
+        for candidate in "$dir"/preview.{jpg,jpeg,png,gif,webp,JPG,JPEG,PNG,GIF,WEBP}; do
+            if [[ -f "$candidate" ]]; then
+                preview="$candidate"
+                break
+            fi
+        done
+    fi
+
+    [[ -n "$preview" ]] || continue
+
+    ext="${preview##*.}"
+    ext="${ext,,}"
+    dest="$preview_dir/$id.$ext"
+
+    if [[ ! -f "$dest" || "$preview" -nt "$dest" ]]; then
+        cp -p "$preview" "$dest"
+    fi
+
+    synced_files["$dest"]=1
+    printf '%s\t%s\t%s\t%s\n' "$dest" "$id" "$project_type" "$preview" >>"$tmp_manifest"
+    count=$((count + 1))
+done
+
+while IFS= read -r -d '' existing; do
+    [[ -n "${synced_files[$existing]:-}" ]] && continue
+
+    existing_base="$(basename "$existing")"
+    if [[ "$existing_base" =~ ^[0-9]+\.(jpe?g|png|gif|webp)$ ]]; then
+        rm -f "$existing"
+    fi
+done < <(find "$preview_dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.webp' \) -print0)
+
+mv "$tmp_manifest" "$manifest"
+printf 'Synced %d Wallpaper Engine previews to %s\n' "$count" "$preview_dir"
+printf 'Included types: %s\n' "${include_types[*]}"
+printf 'Skipped %d failed and %d type-filtered wallpapers\n' "$skipped_failed" "$skipped_type"
